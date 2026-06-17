@@ -1,25 +1,18 @@
-use std::{
-    path::PathBuf,
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     Json, Router,
 };
-use bincode::de::read;
-use http_body_util::Limited;
 use ic_artifact_pool::consensus_pool::ConsensusPoolImpl;
-use ic_config::artifact_pool::{ArtifactPoolConfig, LMDBConfig, PersistentPoolBackend};
-use ic_interfaces::consensus_pool::HeightRange;
+use ic_config::artifact_pool::PersistentPoolBackend;
 use ic_interfaces_state_manager::StateReader;
 use ic_replicated_state::ReplicatedState;
 use ic_types::{
-    consensus::{Block, BlockProposal, HasHeight, HashedBlock},
+    consensus::{Block, HashedBlock},
     crypto::crypto_hash,
     CanisterId, Height,
 };
-use lmdb::Transaction;
 use serde::{Deserialize, Serialize};
 use tower::ServiceBuilder;
 
@@ -30,13 +23,8 @@ pub(crate) fn route() -> &'static str {
 pub(crate) fn new_router(
     state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
     consensus_pool: Arc<RwLock<ConsensusPoolImpl>>,
-    artifact_pool_config: PersistentPoolBackend,
+    _artifact_pool_config: PersistentPoolBackend,
 ) -> Router {
-    let artifact_pool_config = match artifact_pool_config {
-        PersistentPoolBackend::Lmdb(lmdb_config) => Arc::new(lmdb_config),
-        _ => panic!("Unsupported persistent pool backend"),
-    };
-
     Router::new()
         .route_service(
             "/api/v4/height",
@@ -47,15 +35,15 @@ pub(crate) fn new_router(
         .route_service(
             "/api/v4/block/:height",
             axum::routing::get(get_block_at)
-                .with_state((consensus_pool.clone(), artifact_pool_config.clone()))
+                .with_state(consensus_pool.clone())
                 .layer(ServiceBuilder::new().layer(DefaultBodyLimit::disable())),
         )
-    // .route_service(
-    //     "/api/v4/blocks",
-    //     axum::routing::get(list_blocks)
-    //         .with_state(consensus_pool.clone())
-    //         .layer(ServiceBuilder::new().layer(DefaultBodyLimit::disable())),
-    // )
+        .route_service(
+            "/api/v4/blocks",
+            axum::routing::get(list_blocks)
+                .with_state(consensus_pool.clone())
+                .layer(ServiceBuilder::new().layer(DefaultBodyLimit::disable())),
+        )
 }
 
 #[derive(Serialize)]
@@ -66,9 +54,9 @@ struct GetHeight {
 async fn get_height(
     State(state): State<Arc<dyn StateReader<State = ReplicatedState>>>,
 ) -> Json<GetHeight> {
-    let height = state.latest_state_height().get();
-
-    Json(GetHeight { height })
+    Json(GetHeight {
+        height: state.latest_state_height().get(),
+    })
 }
 
 #[derive(Serialize)]
@@ -76,11 +64,11 @@ async fn get_height(
 enum CallResponse {
     Block(GetBlock),
     Blocks(Vec<GetBlock>),
-    Err(Error),
+    Err(ErrMsg),
 }
 
 #[derive(Serialize)]
-struct Error {
+struct ErrMsg {
     message: String,
 }
 
@@ -89,6 +77,9 @@ struct GetBlock {
     prev_hash: String,
     height: u64,
     block_hash: String,
+    time: u64,
+    ingress_count: usize,
+    upsert_count: usize,
     ingress_messages: Option<Vec<IngressMessage>>,
 }
 
@@ -100,25 +91,78 @@ struct IngressMessage {
     sender: String,
 }
 
-impl GetBlock {
-    pub fn set_ingress_messages(&mut self, messages: Vec<IngressMessage>) {
-        self.ingress_messages = Some(messages);
-    }
-}
-
 impl From<&Block> for GetBlock {
     fn from(block: &Block) -> Self {
-        let prev_hash = format!("0x{}", hex::encode(block.clone().parent.get().0));
-        let height = block.clone().height.get();
-
-        let block_hash = HashedBlock::new(crypto_hash, block.clone());
-        let block_hash = format!("0x{}", hex::encode(block_hash.get_hash().clone().get().0));
+        let prev_hash = format!("0x{}", hex::encode(block.parent.clone().get().0));
+        let height = block.height.get();
+        let hb = HashedBlock::new(crypto_hash, block.clone());
+        let block_hash = format!("0x{}", hex::encode(hb.get_hash().clone().get().0));
+        let time = block.context.time.as_nanos_since_unix_epoch();
         Self {
             prev_hash,
             height,
             block_hash,
+            time,
+            ingress_count: 0,
+            upsert_count: 0,
             ingress_messages: None,
         }
+    }
+}
+
+fn extract_block(pool: &ConsensusPoolImpl, height: Height) -> Option<Block> {
+    let finalization = pool.validated.finalization().get_only_by_height(height).ok()?;
+    let block_hash = &finalization.content.block;
+    pool.validated
+        .block_proposal()
+        .get_by_height(height)
+        .find(|bp| bp.content.get_hash() == block_hash)
+        .map(|bp| bp.content.clone().into_inner())
+}
+
+fn block_to_getblock(blk: &Block, with_messages: bool) -> GetBlock {
+    let mut gb = GetBlock::from(blk);
+    if !blk.payload.is_summary() {
+        let batch = &blk.payload.as_ref().as_data().batch;
+        let count = batch.ingress.message_count();
+        gb.ingress_count = count;
+        let mut upsert = 0usize;
+        let mut msgs = vec![];
+        for i in 0..count {
+            if let Ok((message_id, message)) = batch.ingress.get(i) {
+                let c = message.as_ref().content();
+                let method = c.method_name().to_string();
+                if method == "upsert_vote" {
+                    upsert += 1;
+                }
+                if with_messages {
+                    msgs.push(IngressMessage {
+                        message_id: format!("0x{}", message_id.message_id),
+                        canister_id: c.canister_id(),
+                        method_name: method,
+                        sender: c.sender().get().0.to_text(),
+                    });
+                }
+            }
+        }
+        gb.upsert_count = upsert;
+        if with_messages && !msgs.is_empty() {
+            gb.ingress_messages = Some(msgs);
+        }
+    }
+    gb
+}
+
+async fn get_block_at(
+    Path(height): Path<u64>,
+    State(consensus_pool): State<Arc<RwLock<ConsensusPoolImpl>>>,
+) -> Json<CallResponse> {
+    let pool = consensus_pool.read().expect("read pool");
+    match extract_block(&pool, Height::new(height)) {
+        Some(blk) => Json(CallResponse::Block(block_to_getblock(&blk, true))),
+        None => Json(CallResponse::Err(ErrMsg {
+            message: "Block not found".to_string(),
+        })),
     }
 }
 
@@ -128,189 +172,16 @@ struct BlockRange {
     to: u64,
 }
 
-fn list_blocks(
-    range: Query<BlockRange>,
-    State((consensus_pool, lmdb_config)): State<(Arc<RwLock<ConsensusPoolImpl>>, Arc<LMDBConfig>)>,
+async fn list_blocks(
+    Query(range): Query<BlockRange>,
+    State(consensus_pool): State<Arc<RwLock<ConsensusPoolImpl>>>,
 ) -> Json<CallResponse> {
-    let pool = consensus_pool
-        .read()
-        .expect("Failed to read consensus pool");
-
-    let finalizations = pool
-        .validated
-        .finalization()
-        .get_by_height_range(HeightRange {
-            min: Height::new(range.from),
-            max: Height::new(range.to),
-        });
+    let pool = consensus_pool.read().expect("read pool");
     let mut blocks = vec![];
-
-    let log = ic_logger::no_op_logger();
-    let conf = LMDBConfig {
-        persistent_pool_validated_persistent_db_path: lmdb_config
-            .persistent_pool_validated_persistent_db_path
-            .clone(),
-    };
-
-    let pool2 = ic_artifact_pool::lmdb_pool::PersistentHeightIndexedPool::new_consensus_pool(
-        conf, true, log,
-    );
-
-    for finalization in finalizations {
-        let block_hash = &finalization.content.block;
-
-        let key = ic_artifact_pool::lmdb_pool::IdKey::new(
-            Height::new(1),
-            ic_artifact_pool::lmdb_pool::TypeKey::BlockProposal,
-            &block_hash.clone().get(),
-        );
-        let mut ingress_messages = vec![];
-        let tx = pool2.db_env.begin_ro_txn();
-        if tx.is_err() {
-            continue;
+    for h in range.from..=range.to {
+        if let Some(blk) = extract_block(&pool, Height::new(h)) {
+            blocks.push(block_to_getblock(&blk, false));
         }
-        let tx = tx.unwrap();
-
-        let bytes = tx.get(pool2.artifacts, &key);
-        if bytes.is_err() {
-            continue;
-        }
-
-        let block_proposal = bincode::deserialize::<BlockProposal>(bytes.unwrap());
-        if block_proposal.is_err() {
-            continue;
-        }
-        let block_proposal = block_proposal.unwrap();
-        let blk: Block = block_proposal.content.clone().into_inner();
-
-        if !blk.payload.is_summary() {
-            let batch = &blk.payload.as_ref().as_data().batch;
-            let count = batch.ingress.message_count();
-
-            for i in 0..count {
-                let (message_id, message) = batch.ingress.get(i).unwrap();
-                let tx_id = format!("0x{}", message_id.message_id);
-                let tx_content = message.as_ref().content();
-                let canister_id = tx_content.canister_id();
-                let method_name = tx_content.method_name();
-                let sender = tx_content.sender().get().0.to_text();
-
-                ingress_messages.push(IngressMessage {
-                    message_id: tx_id,
-                    canister_id,
-                    method_name: method_name.to_string(),
-                    sender,
-                });
-            }
-        };
-
-        let mut block = GetBlock::from(&blk);
-        if ingress_messages.len() > 0 {
-            block.set_ingress_messages(ingress_messages);
-        }
-
-        blocks.push(block);
     }
-
     Json(CallResponse::Blocks(blocks))
 }
-
-async fn get_block_at(
-    Path(height): Path<u64>,
-    State((consensus_pool, lmdb_config)): State<(Arc<RwLock<ConsensusPoolImpl>>, Arc<LMDBConfig>)>,
-) -> Json<CallResponse> {
-    let pool = consensus_pool
-        .read()
-        .expect("Failed to read consensus pool");
-
-    let height = Height::new(height);
-    let finalization = pool.validated.finalization().get_only_by_height(height);
-    if finalization.is_err() {
-        return Json(CallResponse::Err(Error {
-            message: "Block not found".to_string(),
-        }));
-    }
-
-    let block_hash = &finalization.unwrap().content.block;
-    let log = ic_logger::no_op_logger();
-    let conf = LMDBConfig {
-        persistent_pool_validated_persistent_db_path: lmdb_config
-            .persistent_pool_validated_persistent_db_path
-            .clone(),
-    };
-
-    let pool2 = ic_artifact_pool::lmdb_pool::PersistentHeightIndexedPool::new_consensus_pool(
-        conf, true, log,
-    );
-
-    let key = ic_artifact_pool::lmdb_pool::IdKey::new(
-        Height::new(1),
-        ic_artifact_pool::lmdb_pool::TypeKey::BlockProposal,
-        &block_hash.clone().get(),
-    );
-    let mut ingress_messages = vec![];
-    let tx = pool2.db_env.begin_ro_txn();
-    if tx.is_err() {
-        return Json(CallResponse::Err(Error {
-            message: "Block not found".to_string(),
-        }));
-    }
-    let tx = tx.unwrap();
-
-    let bytes = tx.get(pool2.artifacts, &key);
-    if bytes.is_err() {
-        return Json(CallResponse::Err(Error {
-            message: "Block not found".to_string(),
-        }));
-    }
-
-    let block_proposal = bincode::deserialize::<BlockProposal>(bytes.unwrap());
-    if block_proposal.is_err() {
-        return Json(CallResponse::Err(Error {
-            message: "Block not found".to_string(),
-        }));
-    }
-    let block_proposal = block_proposal.unwrap();
-    let blk: Block = block_proposal.content.clone().into_inner();
-
-    if !blk.payload.is_summary() {
-        let batch = &blk.payload.as_ref().as_data().batch;
-        let count = batch.ingress.message_count();
-
-        for i in 0..count {
-            let (message_id, message) = batch.ingress.get(i).unwrap();
-            let tx_id = format!("0x{}", message_id.message_id);
-            let tx_content = message.as_ref().content();
-            let canister_id = tx_content.canister_id();
-            let method_name = tx_content.method_name();
-            let sender = tx_content.sender().get().0.to_text();
-
-            ingress_messages.push(IngressMessage {
-                message_id: tx_id,
-                canister_id,
-                method_name: method_name.to_string(),
-                sender,
-            });
-        }
-    };
-
-    let mut block = GetBlock::from(&blk);
-    if ingress_messages.len() > 0 {
-        block.set_ingress_messages(ingress_messages);
-    }
-
-    Json(CallResponse::Block(block))
-}
-
-// async fn get_state_at(
-//     Path(height): Path<u64>,
-//     State(pool): State<Arc<RwLock<ConsensusPoolImpl>>>,
-// ) -> Json<GetState> {
-//     let pool = pool.read().expect("Failed to read consensus pool");
-//     pool.
-//     // Json(GetState {
-//     //     prev_hash,
-//     //     height,
-//     //     canister_states,
-//     // })
-// }
