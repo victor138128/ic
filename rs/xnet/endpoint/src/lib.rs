@@ -246,11 +246,38 @@ impl XNetEndpoint {
             #[cfg(not(test))]
             use ic_xnet_hyper::tls_bind;
 
+            // The address to LISTEN on may differ from the address peers are
+            // told to dial. `config.address` comes from this node's registry
+            // record, which is what other subnets connect to — but that
+            // address is not necessarily assigned to this host's interfaces.
+            // Under Kubernetes, for instance, the registry advertises a
+            // Service ClusterIP: routable from anywhere in the cluster, yet
+            // impossible for the pod itself to bind, so start-up died with
+            // "Cannot assign requested address".
+            //
+            // XNET_BIND_ADDR overrides only the bind side. The registry entry
+            // is untouched, so cross-subnet routing keeps working exactly as
+            // before; unset, behaviour is identical to what it was.
+            let bind_address = match std::env::var("XNET_BIND_ADDR") {
+                Ok(v) => v.parse().unwrap_or_else(|e| {
+                    panic!("invalid XNET_BIND_ADDR {:?}: {}", v, e)
+                }),
+                Err(_) => config.address,
+            };
+            if bind_address != config.address {
+                info!(
+                    log,
+                    "XNet binding {} while the registry advertises {}",
+                    bind_address,
+                    config.address
+                );
+            }
+
             let (addr, builder) =
-                tls_bind(&config.address, tls, registry_client).unwrap_or_else(|e| {
+                tls_bind(&bind_address, tls, registry_client).unwrap_or_else(|e| {
                     panic!(
                         "failed to bind XNet socket, address {:?}: {}",
-                        config.address, e
+                        bind_address, e
                     )
                 });
             (
